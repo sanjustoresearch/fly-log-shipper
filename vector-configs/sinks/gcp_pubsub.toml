@@ -1,0 +1,185 @@
+# Google Cloud Pub/Sub sink with OIDC authentication
+#
+# Ships logs directly to Pub/Sub (bypassing Cloud Logging) so raw logs are
+# never persisted. A Cloud Function processes messages with DLP before
+# writing sanitized logs to Cloud Logging.
+#
+# Required environment variables:
+#   GCP_PROJECT_ID              - Google Cloud project ID
+#   GCP_PROJECT_NUMBER          - Google Cloud project number (for workload identity)
+#   GCP_WORKLOAD_IDENTITY_POOL  - Workload identity pool ID (e.g., "fly-io")
+#   GCP_WORKLOAD_IDENTITY_PROVIDER - Workload identity provider ID (e.g., "fly-oidc")
+#   GCP_SERVICE_ACCOUNT         - Service account email to impersonate
+
+# ============================================================================
+# STAGE 1: DROP noisy logs (health checks, heartbeats)
+# These are high-volume, low-value logs that we filter out entirely
+# ============================================================================
+[transforms.gcp_drop_noisy]
+  type = "filter"
+  inputs = ["log_json"]
+  condition = '''
+    msg = string(.message) ?? ""
+    
+    # Drop health checks
+    !contains(msg, "HealthController") &&
+    !contains(msg, "\"path\":\"/up\"") &&
+    
+    # Drop heartbeats
+    !contains(msg, "#heartbeat") &&
+    !contains(msg, "/heartbeat\"")
+  '''
+
+# ============================================================================
+# STAGE 2: REDACT sensitive params in specific controller actions
+# We keep the log structure but replace sensitive values with [REDACTED]
+# ============================================================================
+[transforms.gcp_redact_pii]
+  type = "remap"
+  inputs = ["gcp_drop_noisy"]
+  source = '''
+    msg = string(.message) ?? ""
+    
+    # Only process JSON log messages
+    if !starts_with(msg, "{") {
+      .
+    } else {
+      parsed, err = parse_json(msg)
+      if err != null {
+        .
+      } else {
+        # Extract controller info
+        name = string(get!(parsed, ["name"])) ?? ""
+        payload = object(get!(parsed, ["payload"])) ?? {}
+        action = string(get!(payload, ["action"])) ?? ""
+        params = object(get!(payload, ["params"])) ?? {}
+        
+        redacted = false
+        
+        # === Api::DeckPlaysController ===
+        if contains(name, "DeckPlaysController") {
+          if action == "call_host_function" && exists(params.function_arguments) {
+            params.function_arguments = "[REDACTED]"
+            redacted = true
+          } else if action == "record_event" && exists(params.events) {
+            params.events = "[REDACTED]"
+            redacted = true
+          } else if action == "append_playback_logs" && exists(params.logs) {
+            params.logs = "[REDACTED]"
+            redacted = true
+          } else if action == "append_extracted_collection_items" && exists(params.items) {
+            params.items = "[REDACTED]"
+            redacted = true
+          } else if action == "collect_initial_input" {
+            if exists(params.fields) { params.fields = "[REDACTED]" }
+            if exists(params.initial_input_args) { params.initial_input_args = "[REDACTED]" }
+            redacted = true
+          } else if action == "user_input_files" {
+            if exists(params.file) { params.file = "[REDACTED]" }
+            if exists(params.files) { params.files = "[REDACTED]" }
+            redacted = true
+          } else if action == "bailout" {
+            if exists(params.snapshot) { params.snapshot = "[REDACTED]" }
+            if exists(params.html) { params.html = "[REDACTED]" }
+            if exists(params.intervention_data) { params.intervention_data = "[REDACTED]" }
+            if exists(params.bailout_context) { params.bailout_context = "[REDACTED]" }
+            redacted = true
+          } else if action == "create_pdf_generation" {
+            if exists(params.snapshot) { params.snapshot = "[REDACTED]" }
+            if exists(params.html) { params.html = "[REDACTED]" }
+            if exists(params.events) { params.events = "[REDACTED]" }
+            redacted = true
+          }
+        }
+        
+        # === Api::TaughtWorkflowsController ===
+        if contains(name, "TaughtWorkflowsController") {
+          if action == "events" {
+            if exists(params.events) { params.events = "[REDACTED]" }
+            if exists(params.pageTitle) { params.pageTitle = "[REDACTED]" }
+            if exists(params.pageUrl) { params.pageUrl = "[REDACTED]" }
+            redacted = true
+          } else if action == "finalize" && exists(params.video) {
+            params.video = "[REDACTED]"
+            redacted = true
+          } else if action == "identify_extraction_target" && exists(params.screenshot) {
+            params.screenshot = "[REDACTED]"
+            redacted = true
+          }
+        }
+        
+        # === BrowserExtension::SidePanelController ===
+        if contains(name, "SidePanelController") {
+          if exists(params.data_file) { params.data_file = "[REDACTED]" }
+          if exists(params.items) { params.items = "[REDACTED]" }
+          if exists(params.fields) { params.fields = "[REDACTED]" }
+          if exists(params.input_description) { params.input_description = "[REDACTED]" }
+          if exists(params.confirmation_question) { params.confirmation_question = "[REDACTED]" }
+          if exists(params.confirmation_description) { params.confirmation_description = "[REDACTED]" }
+          if exists(params.acknowledgment_message) { params.acknowledgment_message = "[REDACTED]" }
+          if exists(params.acknowledgment_description) { params.acknowledgment_description = "[REDACTED]" }
+          if exists(params.prompt_message) { params.prompt_message = "[REDACTED]" }
+          if exists(params.action_description) { params.action_description = "[REDACTED]" }
+          if exists(params.action_purpose) { params.action_purpose = "[REDACTED]" }
+          if exists(params.description) { params.description = "[REDACTED]" }
+          if exists(params.user_message) { params.user_message = "[REDACTED]" }
+          redacted = true
+        }
+        
+        # === BrowserExtension::DataTransformationsController ===
+        if contains(name, "DataTransformationsController") {
+          if exists(params.transformation_instructions) { 
+            params.transformation_instructions = "[REDACTED]" 
+            redacted = true
+          }
+        }
+        
+        # === DeckCreationWorkflowsController ===
+        if contains(name, "DeckCreationWorkflowsController") {
+          if exists(params.answers) { params.answers = "[REDACTED]" }
+          if exists(params.message) { params.message = "[REDACTED]" }
+          redacted = true
+        }
+        
+        # === DeckCredentialsController - redact everything ===
+        if contains(name, "DeckCredentialsController") {
+          params = { "redacted": "credentials" }
+          redacted = true
+        }
+        
+        # === UsersController ===
+        if contains(name, "UsersController") && action == "invite_users" {
+          if exists(params.emails) { params.emails = "[REDACTED]" }
+          redacted = true
+        }
+        
+        # Rebuild the message if we redacted anything
+        if redacted {
+          payload.params = params
+          parsed.payload = payload
+          .message = encode_json(parsed)
+        }
+        
+        .
+      }
+    }
+  '''
+
+# ============================================================================
+# SINK: Google Cloud Pub/Sub (direct, no Cloud Logging landing zone)
+# Uses credentials file generated by OIDC auth script
+# ============================================================================
+[sinks.gcp_pubsub]
+  type = "gcp_pubsub"
+  inputs = ["gcp_redact_pii"]
+  project = "${GCP_PROJECT_ID}"
+  topic = "soso-raw-logs"
+  credentials_path = "/tmp/gcp-credentials.json"
+
+  [sinks.gcp_pubsub.encoding]
+    codec = "json"
+
+  [sinks.gcp_pubsub.batch]
+    max_bytes = 10000000
+    max_events = 1000
+    timeout_secs = 5
